@@ -24,6 +24,7 @@ let oscService;
 let oscQueryService;
 let oscEnabled = false;
 let wsManager;
+let persistentVRChatListener;
 let serverConfig = configManager.getServerConfig();
 let hyperateAddon;
 let oscLeashAddon;
@@ -141,21 +142,21 @@ function createWindow() {
       }
     }, 5000); // 5 seconds after UI loads
   });
-  mainWindow.webContents.on('crashed', () => {
+  mainWindow.webContents.on('crashed', async () => {
     if (hasShownCriticalError) {
       return;
     }
     hasShownCriticalError = true;
-    cleanup('renderer-crashed');
+    await cleanup('renderer-crashed');
     dialog.showErrorBox('Application Error', 'The application has encountered an error and will now close.');
     process.exit(1);
   });
-  mainWindow.on('unresponsive', () => {
+  mainWindow.on('unresponsive', async () => {
     if (hasShownCriticalError) {
       return;
     }
     hasShownCriticalError = true;
-    cleanup('renderer-unresponsive');
+    await cleanup('renderer-unresponsive');
     dialog.showErrorBox('Application Unresponsive', 'The application is not responding and will now close.');
     process.exit(1);
   });
@@ -318,6 +319,61 @@ function initOscServer() {
     global.oscService = oscService;
     // Initialize OSC Query service for automatic VRChat discovery
     initOscQueryService();
+  }
+}
+/**
+ * Initialize persistent VRChat listener on port 9001
+ * This runs independently of OSC Query service and always listens for VRChat data
+ */
+async function initPersistentVRChatListener() {
+  try {
+    // If we don't have an OSC Query service instance yet, create one just for the persistent listener
+    if (!oscQueryService) {
+      oscQueryService = new OSCQueryService();
+      // Setup minimal event listeners for the persistent listener functionality
+      oscQueryService.on('osc-message', (oscData) => {
+        // Send to renderer for logging (always, regardless of forwarding status)
+        sendToRenderer('osc-received', {
+          address: oscData.address,
+          value: oscData.value,
+          type: oscData.type,
+          connectionId: null, // Persistent listener messages don't have a connection ID
+          source: 'persistent-vrchat-listener'
+        });
+        // Check if WebSocket forwarding is enabled
+        const wsForwardingEnabled = serverConfig.appSettings?.enableWebSocketForwarding || false;
+        if (!wsForwardingEnabled) {
+          // Don't forward to WebSocket, but still logged above
+          return;
+        }
+        // Forward to WebSocket if connected
+        if (wsManager && wsManager.isConnected) {
+          try {
+            wsManager.sendOscData({
+              address: oscData.address,
+              value: oscData.value,
+              type: oscData.type
+            });
+            // Send to renderer for "forwarded" logging
+            sendToRenderer('osc-forwarded', {
+              address: oscData.address,
+              value: oscData.value,
+              type: oscData.type,
+              connectionId: null,
+              source: 'persistent-vrchat-listener'
+            });
+          } catch (error) {
+            debug.error(`Failed to forward OSC to WebSocket from persistent listener: ${error.message}`);
+          }
+        }
+      });
+    }
+    // Start just the persistent VRChat listener (not the full OSC Query service)
+    await oscQueryService.startPersistentVRChatListener();
+    debug.info('Persistent VRChat listener on port 9001 started independently');
+  } catch (error) {
+    debug.error(`Failed to initialize persistent VRChat listener: ${error.message}`);
+    // Don't throw - this should be non-blocking
   }
 }
 async function initOscQueryService() {
@@ -1105,6 +1161,15 @@ app.whenReady().then(() => {
   createWindow();
   // Set up periodic memory management
   setupMemoryManagement();
+  // Initialize persistent VRChat listener FIRST (always active regardless of OSC service status)
+  setTimeout(async () => {
+    try {
+      await initPersistentVRChatListener();
+      debug.info('Persistent VRChat listener initialized');
+    } catch (error) {
+      debug.error(`Failed to initialize persistent VRChat listener: ${error.message}`);
+    }
+  }, 200); // Initialize very early
   // Initialize OSC after a short delay to ensure the window is ready
   setTimeout(() => {
     if (oscEnabled) {
@@ -1177,7 +1242,7 @@ function setupMemoryManagement() {
     }
   }, 20000); // 20 seconds
 }
-function cleanup(source = 'unknown') {
+async function cleanup(source = 'unknown') {
   if (isShuttingDown) {
     return;
   }
@@ -1207,7 +1272,9 @@ function cleanup(source = 'unknown') {
   try {
     if (oscQueryService) {
       debug.info('Stopping OSC Query service during cleanup...');
-      oscQueryService.stop();
+      // Stop the persistent VRChat listener first
+      await oscQueryService.stopPersistentVRChatListener();
+      await oscQueryService.stop();
       oscQueryService = null;
       debug.info('OSC Query service cleanup completed');
     }
@@ -1251,16 +1318,16 @@ function cleanup(source = 'unknown') {
     global.gc();
   }
 }
-app.on('window-all-closed', () => {
-  cleanup('window-all-closed');
+app.on('window-all-closed', async () => {
+  await cleanup('window-all-closed');
   if (process.platform !== 'darwin') {
     app.quit();
   }
 });
-app.on('before-quit', (event) => {
-  cleanup('before-quit');
+app.on('before-quit', async (event) => {
+  await cleanup('before-quit');
 });
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', async (error) => {
   if (hasShownCriticalError) {
     process.exit(1);
     return;
@@ -1274,14 +1341,14 @@ process.on('uncaughtException', (error) => {
     console.error('Original error:', error);
   }
   try {
-    cleanup('uncaught-exception');
+    await cleanup('uncaught-exception');
   } catch (cleanupError) {
     debug.error(`Error during cleanup: ${cleanupError.message}`);
   }
   dialog.showErrorBox('Critical Error', 'An unexpected error occurred. The application will now close.');
   process.exit(1);
 });
-process.on('unhandledRejection', (reason) => {
+process.on('unhandledRejection', async (reason) => {
   if (hasShownCriticalError) {
     process.exit(1);
     return;
@@ -1295,7 +1362,7 @@ process.on('unhandledRejection', (reason) => {
     console.error('Original rejection:', reason);
   }
   try {
-    cleanup('unhandled-rejection');
+    await cleanup('unhandled-rejection');
   } catch (cleanupError) {
     debug.error(`Error during cleanup: ${cleanupError.message}`);
   }

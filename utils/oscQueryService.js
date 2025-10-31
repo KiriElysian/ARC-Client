@@ -57,6 +57,7 @@ class OSCQueryService extends EventEmitter {
         this.httpServer = null;
         this.oscUdpPort = null; // OSC UDP listener on random port (for OSC Query protocol)
         this.vrchatListenerPort = null; // Passive listener on port 9001 (VRChat's default output)
+        this.persistentVRChatListener = null; // Always-active listener on port 9001
         this.bonjour = null;
         this.bonjourService = null;
         this.isRunning = false;
@@ -351,6 +352,70 @@ class OSCQueryService extends EventEmitter {
         });
     }
     /**
+     * Start the persistent VRChat listener on port 9001
+     * This runs independently of the OSC Query service
+     */
+    async startPersistentVRChatListener() {
+        try {
+            // Close existing listener if it exists
+            if (this.persistentVRChatListener) {
+                try {
+                    this.persistentVRChatListener.removeAllListeners();
+                    this.persistentVRChatListener.close();
+                    this.persistentVRChatListener = null;
+                    console.log('[OSCQuery] Closed existing persistent VRChat listener');
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                } catch (error) {
+                    console.error('[OSCQuery] Error closing existing persistent VRChat listener:', error);
+                }
+            }
+            // Create passive listener on port 9001 for VRChat output
+            this.persistentVRChatListener = new osc.UDPPort({
+                localAddress: '127.0.0.1',
+                localPort: 9001,
+                metadata: true
+            });
+            this.persistentVRChatListener.on('message', (oscMsg) => {
+                // Always handle messages through the main OSC message handler
+                this._handleOscMessage(oscMsg);
+            });
+            this.persistentVRChatListener.on('ready', () => {
+                console.log('[OSCQuery] Persistent VRChat listener active on port 9001');
+            });
+            this.persistentVRChatListener.on('error', (error) => {
+                if (error.code === 'EADDRINUSE') {
+                    console.warn('[OSCQuery] Port 9001 is already in use - persistent VRChat listener cannot bind. OSC data will be received through OSC Query port instead.');
+                } else if (error.code === 'EACCES') {
+                    console.warn('[OSCQuery] Permission denied for port 9001 - persistent VRChat listener cannot bind. OSC data will be received through OSC Query port instead.');
+                } else {
+                    console.error('[OSCQuery] Persistent VRChat listener error:', error);
+                }
+            });
+            // Open the persistent listener (non-blocking)
+            this.persistentVRChatListener.open();
+        } catch (error) {
+            console.error('[OSCQuery] Failed to create persistent VRChat listener:', error);
+            // Don't throw - this should be non-blocking for the main service
+        }
+    }
+    /**
+     * Stop the persistent VRChat listener
+     */
+    async stopPersistentVRChatListener() {
+        if (this.persistentVRChatListener) {
+            try {
+                console.log('[OSCQuery] Stopping persistent VRChat listener on port 9001...');
+                this.persistentVRChatListener.removeAllListeners();
+                this.persistentVRChatListener.close();
+                this.persistentVRChatListener = null;
+                console.log('[OSCQuery] Persistent VRChat listener stopped');
+                await new Promise(resolve => setTimeout(resolve, 100));
+            } catch (error) {
+                console.error('[OSCQuery] Error stopping persistent VRChat listener:', error);
+            }
+        }
+    }
+    /**
      * Start the OSC Query service
      */
     async start() {
@@ -411,10 +476,14 @@ class OSCQueryService extends EventEmitter {
             // Open the OSC UDP port
             this.oscUdpPort.open();
             
-            // DISABLED: VRChat listener on port 9001
-            // This was causing port binding conflicts (EACCES errors)
-            // OSC data will be received through the main OSC Query port instead
-            console.log('[OSCQuery] VRChat port 9001 listener disabled - using OSC Query port for all communication');
+            // Start the persistent VRChat listener on port 9001 (if not already running)
+            // This runs independently and always listens for VRChat data
+            if (!this.persistentVRChatListener) {
+                await this.startPersistentVRChatListener();
+                console.log('[OSCQuery] Persistent VRChat listener enabled on port 9001 for always-on data receiving');
+            } else {
+                console.log('[OSCQuery] Persistent VRChat listener already active on port 9001');
+            }
             // Initialize Bonjour for mDNS
             this.bonjour = new Bonjour();
             // Advertise service via mDNS with error handling for name conflicts
@@ -531,19 +600,8 @@ class OSCQueryService extends EventEmitter {
                     console.error('[OSCQuery] Error stopping OSC UDP listener:', error);
                 }
             }
-            // Stop VRChat passive listener on port 9001
-            if (this.vrchatListenerPort) {
-                try {
-                    // For native dgram socket, just close it
-                    this.vrchatListenerPort.removeAllListeners();
-                    this.vrchatListenerPort.close();
-                    this.vrchatListenerPort = null;
-                    console.log('[OSCQuery] VRChat passive listener stopped');
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                } catch (error) {
-                    console.error('[OSCQuery] Error stopping VRChat listener:', error);
-                }
-            }
+            // Stop persistent VRChat listener on port 9001
+            await this.stopPersistentVRChatListener();
             // Stop mDNS service to unpublish from network
             if (this.bonjourService) {
                 try {
@@ -660,7 +718,8 @@ class OSCQueryService extends EventEmitter {
             httpPort: this.httpPort,
             oscPort: this.oscPort,
             serviceName: this.appName,
-            unsubscriptions: this.getUnsubscriptions()
+            unsubscriptions: this.getUnsubscriptions(),
+            persistentVRChatListenerActive: !!this.persistentVRChatListener
         };
     }
     

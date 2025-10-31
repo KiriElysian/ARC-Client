@@ -17,9 +17,16 @@ class OscService extends EventEmitter {
     this.targetPort = targetPort;
     this.targetAddress = targetAddress;
     if (localPort === null) {
-      this.localPort = this.findAvailablePort(9001, 9100);
+      // Start from 9002 to avoid port 9001 which is reserved for persistent VRChat listener
+      this.localPort = this.findAvailablePort(9002, 9100);
     } else {
-      this.localPort = localPort;
+      // If explicitly set to 9001, find alternative to avoid conflict with persistent listener
+      if (localPort === 9001) {
+        console.warn('OSC Service: Port 9001 is reserved for persistent VRChat listener, using alternative port');
+        this.localPort = this.findAvailablePort(9002, 9100);
+      } else {
+        this.localPort = localPort;
+      }
     }
     try {
       this.primaryUdpPort = new osc.UDPPort({
